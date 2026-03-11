@@ -1,0 +1,30 @@
+SCAVENGER implementation audit (current state)
+
+Implemented
+- Frontend routes exist and render: /, /dashboard, /intake, /results, /apply.
+- Intake flow calls POST /api/intake with the expected request shape.
+- FastAPI backend runs with CORS configured for Vite localhost origins.
+- Mocked grant matching loop is functional end-to-end.
+
+Missing from the original build plan
+- Real OpenAI integration (Assistants retrieval, GPT-4o vision, structured outputs) is not wired.
+- Eligibility, proposal grading, and autofill workflows were UI placeholders only.
+- Operational runbook was not explicit enough for first-time setup.
+
+Added in this pass
+- Backend mock implementations for:
+  - analyze_eligibility_document
+  - grade_and_rewrite_proposal
+  - generate_autofill_payload
+- API endpoints:
+  - POST /api/eligibility
+  - POST /api/proposal/review
+  - POST /api/autofill
+- Clear local run steps + validation checklist in README.
+
+Required to run web app successfully (minimum)
+1) Install Python and Node dependencies.
+2) Start FastAPI server on :8000.
+3) Start Vite frontend on :5173.
+4) Confirm /api/health returns {"status":"ok"}.
+5) Submit an intake prompt in /intake and verify matched grants render in /results.
