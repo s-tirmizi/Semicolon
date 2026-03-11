@@ -83,3 +83,46 @@ To win, do not try to build every feature perfectly. Focus on the "Wow-Factor" l
 1.  **Hardcode the Vector Store:** Don't build a web scraper during the hackathon. Manually download 10 real university financial PDFs and upload them to the OpenAI Assistant beforehand.
 2.  **Nail the Vision Demo:** Make sure the `analyze_eligibility_document` function works flawlessly. Watching an AI read a messy screenshot of a transcript and instantly approve a grant is a winning demo moment.
 3.  **Fake the PDF Output if necessary:** If mapping PDF fields programmatically takes too long, have the AI generate a perfectly formatted Markdown or HTML document that looks like a completed application form.
+
+
+# Role
+You are an expert full-stack developer and AI integration specialist. We are building a hackathon MVP called **SCAVENGER: AI Campus Financial Advocate**. 
+
+# Core Mission
+Democratize access to hidden university resources, emergency funds, and departmental grants by eliminating bureaucratic friction using generative AI. 
+
+# Tech Stack
+* **Frontend:** React (initialized via Vite) for fast rendering and hot-reloading.
+* **Styling:** Tailwind CSS for rapid, utility-first UI development.
+* **Backend:** Python with FastAPI. Must include CORS middleware configured for local frontend communication.
+* **AI Integration:** OpenAI API (Assistants API for document retrieval, GPT-4o Vision for eligibility extraction, Structured Outputs for strict JSON data).
+* **State Management:** React `useState` and `useContext` (no Redux).
+* **HTTP Client:** Axios for API calls.
+
+# 1. App Architecture & Routing
+Build the following clean, simple flow to minimize user drop-off:
+* `/` (Home): Landing page with a minimalist search bar ("What do you need funding for?") and a "Start Scanning" CTA.
+* `/dashboard`: The main hub. Split view options: Route 1 (Individual Advocate) or Route 2 (Organization Treasurer - e.g., Switch Energy Club). Sidebar for saved scans.
+* `/intake`: Chat interface. User types their unstructured need (e.g., "I need a travel grant to present a poster at the Jackson School of Geosciences Symposium this February...").
+* `/results`: Dashboard showing matched funds (Name, Amount, Deadline) and an AI Match Score (1-100%). Includes a "Check Eligibility" button.
+* `/apply`: Workspace for drafting proposals. Includes a drag-and-drop document zone, a split-screen AI proposal writer/grader, and a "Generate PDF" (or Markdown equivalent) button.
+
+# 2. API Data Contracts
+Ensure the frontend and backend communicate using these exact structures:
+* **Endpoint:** `POST /api/intake`
+    * **Request Payload (React -> FastAPI):**
+        `{ "user_prompt": "string", "student_context": { "major": "string", "role": "string" } }`
+    * **Response Payload (FastAPI -> React):**
+        `{ "matched_grants": [ { "name": "string", "amount": number, "match_score": number, "next_step": "string" } ] }`
+
+# 3. Backend Core Functions (Python/FastAPI)
+Implement the following core AI logic:
+* `search_knowledge_base(user_prompt)`: Uses OpenAI Assistants API with the `file_search` tool (assume a pre-loaded Vector Store of university PDFs). Returns top 3 matching grants.
+* `analyze_eligibility_document(image_base64)`: Uses GPT-4o Vision. Prompt it to read screenshots of transcripts/leases. **Crucial:** Must use strict Structured Outputs to return exact JSON: `{"eligible": boolean, "extracted_gpa": number, "missing_criteria": []}`.
+* `grade_and_rewrite_proposal(student_draft, grant_rubric)`: Uses OpenAI Structured Outputs to return a strict JSON response containing a "Score" and "Suggested_Rewrites".
+* `generate_autofill_payload(user_data, form_fields)`: Maps the gathered conversational data to standard PDF fields (output a cleanly formatted HTML/Markdown mockup if actual PDF mapping takes too long for the MVP).
+
+# Execution Instructions
+1.  Begin by generating the `main.py` file for the FastAPI backend, including the CORS configuration and the `POST /api/intake` route scaffolding.
+2.  Next, provide the terminal commands to initialize the Vite React app and install Tailwind CSS.
+3.  Do not over-engineer; focus on a functional "Wow-Factor" loop demonstrating the AI Vision parsing and the unstructured-to-structured intake flow.
