@@ -1,11 +1,13 @@
 import axios from "axios";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { useAppContext } from "../context/AppContext";
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 function SignupPage() {
   const navigate = useNavigate();
+  const { saveAuth } = useAppContext();
   const [form, setForm] = useState({
     username: "",
     password: "",
@@ -27,8 +29,9 @@ function SignupPage() {
     setError("");
     setLoading(true);
     try {
-      await axios.post(`${apiBaseUrl}/api/signup`, form);
-      navigate("/login");
+      const response = await axios.post(`${apiBaseUrl}/api/signup`, form);
+      saveAuth(response.data.token, response.data.user);
+      navigate("/");
     } catch (err) {
       setError(err.response?.data?.detail || "Signup failed.");
     } finally {
