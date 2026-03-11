@@ -1,4 +1,5 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import { useAppContext } from "../context/AppContext";
 
 const links = [
   { to: "/", label: "Home" },
@@ -9,6 +10,14 @@ const links = [
 ];
 
 function Layout() {
+  const navigate = useNavigate();
+  const { userProfile, logout } = useAppContext();
+
+  const handleLogout = () => {
+    logout();
+    navigate("/login");
+  };
+
   return (
     <div className="min-h-screen bg-[var(--color-cream)] text-[var(--color-ink)]">
       <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_top,rgba(175,146,71,0.18),transparent_38%),linear-gradient(135deg,rgba(8,27,47,0.06),transparent_45%),linear-gradient(180deg,rgba(255,255,255,0.45),rgba(255,255,255,0))]" />
@@ -16,14 +25,10 @@ function Layout() {
         <header className="mb-8 rounded-full border border-white/60 bg-white/75 px-5 py-3 shadow-[0_20px_60px_rgba(15,23,42,0.08)] backdrop-blur">
           <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
             <div>
-              <p className="font-sans text-xs uppercase tracking-[0.35em] text-[var(--color-muted)]">
-                SCAVENGER
-              </p>
-              <p className="font-serif text-xl text-[var(--color-navy)]">
-                AI Campus Financial Advocate
-              </p>
+              <p className="font-sans text-xs uppercase tracking-[0.35em] text-[var(--color-muted)]">SCAVENGER</p>
+              <p className="font-serif text-xl text-[var(--color-navy)]">AI Campus Financial Advocate</p>
             </div>
-            <nav className="flex flex-wrap gap-2">
+            <nav className="flex flex-wrap items-center gap-2">
               {links.map((link) => (
                 <NavLink
                   key={link.to}
@@ -39,6 +44,13 @@ function Layout() {
                   {link.label}
                 </NavLink>
               ))}
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="rounded-full border border-[var(--color-border)] px-4 py-2 text-sm"
+              >
+                {userProfile?.username ? `Logout ${userProfile.username}` : "Logout"}
+              </button>
             </nav>
           </div>
         </header>
