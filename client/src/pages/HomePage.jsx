@@ -1,18 +1,40 @@
+import axios from "axios";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAppContext } from "../context/AppContext";
 
+const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+
 function HomePage() {
   const navigate = useNavigate();
-  const { latestPrompt, setLatestPrompt } = useAppContext();
+  const { latestPrompt, setLatestPrompt, userProfile, setMatchedGrants, setRequestState } = useAppContext();
   const [draftPrompt, setDraftPrompt] = useState(
     latestPrompt || "I need funding for travel, housing support, or a research opportunity.",
   );
+  const [scrapeLoading, setScrapeLoading] = useState(false);
 
   const handleSubmit = (event) => {
     event.preventDefault();
     setLatestPrompt(draftPrompt.trim());
     navigate("/dashboard");
+  };
+
+  const handleFetchLatest = async () => {
+    if (!userProfile) return;
+    setScrapeLoading(true);
+    setRequestState("loading");
+    try {
+      const response = await axios.post(`${apiBaseUrl}/api/scrape`, {
+        user_profile: userProfile,
+      });
+      setMatchedGrants(response.data);
+      setRequestState("success");
+      navigate("/results");
+    } catch {
+      setRequestState("error");
+    } finally {
+      setScrapeLoading(false);
+    }
   };
 
   return (
@@ -43,19 +65,25 @@ function HomePage() {
           </label>
           <div className="flex flex-wrap items-center gap-4">
             <button
-              type="submit"
-              className="rounded-full bg-[var(--color-navy)] px-6 py-3 font-medium text-white transition hover:bg-[var(--color-forest)]"
+              type="button"
+              onClick={handleFetchLatest}
+              disabled={scrapeLoading}
+              className="rounded-full bg-[var(--color-navy)] px-6 py-3 font-medium text-white transition hover:bg-[var(--color-forest)] disabled:bg-slate-400"
             >
-              Start Scanning
+              {scrapeLoading ? "Scraping UT Resources..." : "Fetch Latest Data"}
             </button>
             <button
-              type="button"
-              onClick={() => navigate("/intake")}
+              type="submit"
               className="rounded-full border border-[var(--color-border)] px-6 py-3 font-medium text-[var(--color-ink)] transition hover:border-[var(--color-gold)] hover:bg-[var(--color-gold-soft)]"
             >
               Open intake directly
             </button>
           </div>
+          {scrapeLoading ? (
+            <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--color-panel)]">
+              <div className="h-full w-1/2 animate-pulse rounded-full bg-[var(--color-gold)]" />
+            </div>
+          ) : null}
         </form>
       </div>
 
@@ -71,22 +99,6 @@ function HomePage() {
             The intake converts freeform student context into clear matched
             funds, next steps, and an application workspace.
           </p>
-        </article>
-        <article className="animate-rise rounded-[2rem] border border-white/70 bg-white/85 p-6 shadow-[0_18px_60px_rgba(15,23,42,0.08)] [animation-delay:220ms]">
-          <p className="font-sans text-xs uppercase tracking-[0.35em] text-[var(--color-muted)]">
-            Demo-ready flow
-          </p>
-          <div className="mt-5 grid gap-3 text-sm text-[var(--color-muted)]">
-            <div className="rounded-2xl bg-[var(--color-panel)] px-4 py-3">
-              1. Intake narrative
-            </div>
-            <div className="rounded-2xl bg-[var(--color-panel)] px-4 py-3">
-              2. AI-ranked fund matches
-            </div>
-            <div className="rounded-2xl bg-[var(--color-panel)] px-4 py-3">
-              3. Guided draft and document upload
-            </div>
-          </div>
         </article>
       </div>
     </section>

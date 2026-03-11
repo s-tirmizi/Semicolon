@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import GrantCard from "../components/GrantCard";
 import SavedScansPanel from "../components/SavedScansPanel";
@@ -6,6 +7,11 @@ import { useAppContext } from "../context/AppContext";
 function ResultsPage() {
   const navigate = useNavigate();
   const { latestPrompt, matchedGrants, setSelectedGrant } = useAppContext();
+
+  const sortedGrants = useMemo(
+    () => [...matchedGrants].sort((a, b) => (b.match_score || 0) - (a.match_score || 0)),
+    [matchedGrants],
+  );
 
   const handleSelectGrant = (grant) => {
     setSelectedGrant(grant);
@@ -29,14 +35,14 @@ function ResultsPage() {
           </p>
         </div>
 
-        {matchedGrants.length === 0 ? (
+        {sortedGrants.length === 0 ? (
           <div className="rounded-[2rem] border border-dashed border-[var(--color-border)] bg-white/75 p-8 text-sm leading-8 text-[var(--color-muted)]">
             There are no matched grants yet. Go to the intake page, submit a
             funding narrative, and this view will populate with ranked options.
           </div>
         ) : (
           <div className="space-y-5">
-            {matchedGrants.map((grant) => (
+            {sortedGrants.map((grant) => (
               <GrantCard
                 key={`${grant.name}-${grant.deadline}`}
                 grant={grant}

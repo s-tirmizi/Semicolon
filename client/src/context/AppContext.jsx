@@ -1,4 +1,6 @@
-import { createContext, useContext, useState } from "react";
+import { createContext, useContext, useMemo, useState } from "react";
+
+const STORAGE_KEY = "scavenger_auth";
 
 const initialStudentContext = {
   major: "Undeclared",
@@ -20,7 +22,26 @@ function buildSavedScan(prompt, grants) {
   };
 }
 
+function loadAuthState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      return { token: "", userProfile: null };
+    }
+    const parsed = JSON.parse(raw);
+    return {
+      token: parsed.token || "",
+      userProfile: parsed.userProfile || null,
+    };
+  } catch {
+    return { token: "", userProfile: null };
+  }
+}
+
 export function AppProvider({ children }) {
+  const authState = loadAuthState();
+  const [authToken, setAuthToken] = useState(authState.token);
+  const [userProfile, setUserProfile] = useState(authState.userProfile);
   const [studentContext, setStudentContext] = useState(initialStudentContext);
   const [latestPrompt, setLatestPrompt] = useState("");
   const [matchedGrants, setMatchedGrants] = useState([]);
@@ -28,6 +49,24 @@ export function AppProvider({ children }) {
   const [savedScans, setSavedScans] = useState([]);
   const [requestState, setRequestState] = useState("idle");
   const [errorMessage, setErrorMessage] = useState("");
+
+  const saveAuth = (token, profile) => {
+    setAuthToken(token);
+    setUserProfile(profile);
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        token,
+        userProfile: profile,
+      }),
+    );
+  };
+
+  const logout = () => {
+    setAuthToken("");
+    setUserProfile(null);
+    localStorage.removeItem(STORAGE_KEY);
+  };
 
   const saveScan = (prompt, grants) => {
     if (!prompt || !grants.length) {
@@ -38,22 +77,30 @@ export function AppProvider({ children }) {
     setSavedScans((current) => [nextScan, ...current].slice(0, 6));
   };
 
-  const value = {
-    studentContext,
-    setStudentContext,
-    latestPrompt,
-    setLatestPrompt,
-    matchedGrants,
-    setMatchedGrants,
-    selectedGrant,
-    setSelectedGrant,
-    savedScans,
-    saveScan,
-    requestState,
-    setRequestState,
-    errorMessage,
-    setErrorMessage,
-  };
+  const value = useMemo(
+    () => ({
+      authToken,
+      userProfile,
+      isAuthenticated: Boolean(authToken && userProfile),
+      saveAuth,
+      logout,
+      studentContext,
+      setStudentContext,
+      latestPrompt,
+      setLatestPrompt,
+      matchedGrants,
+      setMatchedGrants,
+      selectedGrant,
+      setSelectedGrant,
+      savedScans,
+      saveScan,
+      requestState,
+      setRequestState,
+      errorMessage,
+      setErrorMessage,
+    }),
+    [authToken, userProfile, studentContext, latestPrompt, matchedGrants, selectedGrant, savedScans, requestState, errorMessage],
+  );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

@@ -6,13 +6,14 @@ import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 from typing import Any, Generator, List
 
+import requests
 from fastapi import Body, Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from bs4 import BeautifulSoup
 
 
 DATABASE_URL = os.getenv("SCAVENGER_DB_PATH", "server/scavenger.db")
@@ -81,6 +82,43 @@ class AuthResponse(BaseModel):
     username: str
 
 
+class SignupRequest(BaseModel):
+    username: str = Field(..., min_length=3)
+    password: str = Field(..., min_length=8)
+    major: str = Field(..., min_length=1)
+    degree_level: str = Field(..., min_length=1)
+    organizations: str = Field(default="")
+    needs: str = Field(default="")
+
+
+class UserProfile(BaseModel):
+    username: str
+    major: str
+    degree_level: str
+    organizations: str
+    needs: str
+
+
+class LoginResponse(BaseModel):
+    token: str
+    user: UserProfile
+
+
+class ScrapeRequest(BaseModel):
+    user_profile: UserProfile
+
+
+class ScrapedGrant(BaseModel):
+    name: str
+    amount: str
+    deadline: str
+    raw_description: str
+    summary: str
+    is_eligible: bool
+    match_score: int
+    match_justification: str
+
+
 class SavedScan(BaseModel):
     id: int
     prompt: str
@@ -131,10 +169,18 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
+                major TEXT NOT NULL DEFAULT '',
+                degree_level TEXT NOT NULL DEFAULT '',
+                organizations TEXT NOT NULL DEFAULT '',
+                needs TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             )
             """
         )
+        user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        for col in ["major", "degree_level", "organizations", "needs"]:
+            if col not in user_columns:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sessions (
@@ -413,6 +459,184 @@ def login(payload: AuthRequest) -> AuthResponse:
         token, expires_at = build_token()
         conn.execute("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)", (token, user["id"], expires_at))
     return AuthResponse(token=token, username=user["username"])
+
+
+@app.post("/api/signup", response_model=LoginResponse)
+def signup(payload: SignupRequest) -> LoginResponse:
+    with get_db() as conn:
+        existing = conn.execute("SELECT id FROM users WHERE username = ?", (payload.username,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="Username already exists")
+
+        conn.execute(
+            """
+            INSERT INTO users (username, password_hash, major, degree_level, organizations, needs, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.username,
+                hash_password(payload.password),
+                payload.major,
+                payload.degree_level,
+                payload.organizations,
+                payload.needs,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        user = conn.execute(
+            "SELECT id, username, major, degree_level, organizations, needs FROM users WHERE username = ?",
+            (payload.username,),
+        ).fetchone()
+        token, expires_at = build_token()
+        conn.execute("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)", (token, user["id"], expires_at))
+
+    return LoginResponse(
+        token=token,
+        user=UserProfile(
+            username=user["username"],
+            major=user["major"],
+            degree_level=user["degree_level"],
+            organizations=user["organizations"],
+            needs=user["needs"],
+        ),
+    )
+
+
+@app.post("/api/login", response_model=LoginResponse)
+def user_login(payload: AuthRequest) -> LoginResponse:
+    with get_db() as conn:
+        user = conn.execute(
+            "SELECT id, username, password_hash, major, degree_level, organizations, needs FROM users WHERE username = ?",
+            (payload.username,),
+        ).fetchone()
+        if not user or user["password_hash"] != hash_password(payload.password):
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+
+        token, expires_at = build_token()
+        conn.execute("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)", (token, user["id"], expires_at))
+
+    return LoginResponse(
+        token=token,
+        user=UserProfile(
+            username=user["username"],
+            major=user["major"],
+            degree_level=user["degree_level"],
+            organizations=user["organizations"],
+            needs=user["needs"],
+        ),
+    )
+
+
+SCRAPE_TARGETS = [
+    "https://onestop.utexas.edu/managing-costs/scholarships-financial-aid/types-of-financial-aid/scholarships/",
+    "https://deanofstudents.utexas.edu/sos/studentemergencyfund.php",
+    "https://deanofstudents.utexas.edu/sa/student-organization-funding-opportunities.php",
+]
+
+
+def scrape_ut_resources() -> list[dict[str, str]]:
+    opportunities: list[dict[str, str]] = []
+    for url in SCRAPE_TARGETS:
+        try:
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+        except Exception:
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        headings = soup.select("h1, h2, h3, h4")
+        for heading in headings[:15]:
+            name = heading.get_text(" ", strip=True)
+            if len(name) < 8:
+                continue
+            block = heading.find_parent(["section", "article", "div", "li"]) or heading.parent
+            block_text = block.get_text(" ", strip=True) if block else ""
+            if len(block_text) < 40:
+                continue
+            opportunities.append(
+                {
+                    "name": name[:140],
+                    "amount": "See source",
+                    "deadline": "See source",
+                    "raw_description": f"Source: {url}\n{block_text[:1300]}",
+                }
+            )
+        if len(opportunities) >= 12:
+            break
+    deduped: list[dict[str, str]] = []
+    seen = set()
+    for item in opportunities:
+        key = item["name"].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped[:10]
+
+
+def enrich_grant_with_profile(grant: dict[str, str], user_profile: UserProfile) -> ScrapedGrant:
+    client = get_openai_client()
+    if not client:
+        return ScrapedGrant(
+            **grant,
+            summary=grant["raw_description"][:140],
+            is_eligible=True,
+            match_score=70,
+            match_justification=f"Based on your {user_profile.degree_level} profile in {user_profile.major}, this may be relevant.",
+        )
+
+    try:
+        system_prompt = (
+            "You are an expert financial advocate for university students. Evaluate this funding opportunity "
+            "against the following student profile:\n"
+            f"- Major: {user_profile.major}\n"
+            f"- Degree: {user_profile.degree_level}\n"
+            f"- Orgs: {user_profile.organizations}\n"
+            f"- Needs: {user_profile.needs}"
+        )
+        response = client.responses.create(
+            model=OPENAI_MODEL_TEXT,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        "Funding opportunity description:\n"
+                        f"{grant['raw_description']}\n\n"
+                        "Return strict JSON only with keys: summary (string), is_eligible (boolean), "
+                        "match_score (integer 1-100), match_justification (string)."
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+        )
+        enriched = parse_openai_json(response)
+        return ScrapedGrant(
+            **grant,
+            summary=str(enriched.get("summary", grant["raw_description"][:140])),
+            is_eligible=bool(enriched.get("is_eligible", True)),
+            match_score=int(max(1, min(100, int(enriched.get("match_score", 65))))),
+            match_justification=str(enriched.get("match_justification", "Potential fit based on your profile.")),
+        )
+    except Exception:
+        return ScrapedGrant(
+            **grant,
+            summary=grant["raw_description"][:140],
+            is_eligible=True,
+            match_score=60,
+            match_justification="AI enrichment unavailable; review raw description for fit.",
+        )
+
+
+@app.post("/api/scrape", response_model=list[ScrapedGrant])
+def scrape(payload: ScrapeRequest) -> list[ScrapedGrant]:
+    scraped = scrape_ut_resources()
+    enriched = [enrich_grant_with_profile(item, payload.user_profile) for item in scraped]
+    enriched.sort(key=lambda item: item.match_score, reverse=True)
+    os.makedirs("data", exist_ok=True)
+    with open("data/latest_grants.json", "w", encoding="utf-8") as file:
+        json.dump([item.model_dump() for item in enriched], file, indent=2)
+    return enriched
 
 
 @app.get("/api/scans", response_model=List[SavedScan])
