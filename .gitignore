@@ -3,3 +3,5 @@ client/dist/
 server/.venv/
 __pycache__/
 *.pyc
+
+server/scavenger.db

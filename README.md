@@ -11,11 +11,17 @@ Hackathon MVP for "AI Campus Financial Advocate".
   - `/results`
   - `/apply`
 - FastAPI backend with CORS configured for local frontend development.
-- End-to-end mock intake flow (`POST /api/intake`) that returns ranked grant matches.
-- Additional mock backend AI workflow endpoints for plan coverage:
-  - `POST /api/eligibility`
-  - `POST /api/proposal/review`
-  - `POST /api/autofill`
+- Real OpenAI-enabled backend flows with fallback behavior when `OPENAI_API_KEY` is missing:
+  - Assistants retrieval for grant matching with optional vector store (`POST /api/intake`).
+  - GPT-4o vision eligibility extraction (`POST /api/eligibility`).
+  - Structured proposal grading + rewrite suggestions (`POST /api/proposal/review`).
+  - Structured field mapping for autofill (`POST /api/autofill`).
+- Real PDF export pipeline that returns base64 PDF output (`POST /api/autofill/pdf`).
+- SQLite persistence layer for users, sessions, and saved scans.
+- Auth + multi-user state endpoints:
+  - `POST /api/auth/register`
+  - `POST /api/auth/login`
+  - `GET /api/scans`
 
 ## Quick start
 
@@ -24,6 +30,14 @@ Hackathon MVP for "AI Campus Financial Advocate".
 ```bash
 python -m pip install -r server/requirements.txt
 uvicorn server.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Optional OpenAI env vars:
+
+```bash
+export OPENAI_API_KEY=...
+export OPENAI_ASSISTANT_ID=...
+export OPENAI_VECTOR_STORE_ID=...
 ```
 
 ### 2) Frontend
@@ -47,44 +61,5 @@ VITE_API_BASE_URL=http://127.0.0.1:8000
 ## Validation checklist
 
 - `GET /api/health` returns `{"status":"ok"}`.
-- Submit prompt on `/intake` and ensure `/results` shows matched grants.
-- Include phrase `force error` in intake prompt to verify frontend error handling.
-
-## Known gaps (for production)
-
-- OpenAI Assistants API + vector store retrieval is mocked.
-- GPT-4o Vision eligibility extraction is mocked.
-- Structured-output proposal grading and PDF autofill are mocked.
-- No persistence/database for saved scans.
-
-## API contracts in use
-
-### `POST /api/intake`
-
-Request
-
-```json
-{
-  "user_prompt": "I need travel funding and short-term rent help",
-  "student_context": {
-    "major": "Computer Science",
-    "role": "Individual Advocate"
-  }
-}
-```
-
-Response
-
-```json
-{
-  "matched_grants": [
-    {
-      "name": "Undergraduate Research Travel Fund",
-      "amount": 1500,
-      "deadline": "April 18, 2026",
-      "match_score": 92,
-      "next_step": "Prepare a short abstract, conference acceptance note, and estimated travel budget."
-    }
-  ]
-}
-```
+- Register/login, then call `POST /api/intake` with `Authorization: Bearer <token>` and verify `GET /api/scans` persists history.
+- Call `POST /api/autofill/pdf` and decode `pdf_base64` to validate export output.

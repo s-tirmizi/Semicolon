@@ -1,8 +1,26 @@
-from typing import Any, List
+import base64
+import hashlib
+import json
+import os
+import secrets
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
+from typing import Any, Generator, List
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+
+
+DATABASE_URL = os.getenv("SCAVENGER_DB_PATH", "server/scavenger.db")
+OPENAI_MODEL_TEXT = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini")
+OPENAI_MODEL_VISION = os.getenv("OPENAI_VISION_MODEL", "gpt-4o")
+OPENAI_ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID", "")
+OPENAI_VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "")
+TOKEN_TTL_HOURS = 72
 
 
 class StudentContext(BaseModel):
@@ -48,23 +66,124 @@ class AutofillResponse(BaseModel):
     markdown_preview: str
 
 
-app = FastAPI(title="SCAVENGER Mock API", version="0.2.0")
+class PDFResponse(BaseModel):
+    file_name: str
+    pdf_base64: str
+
+
+class AuthRequest(BaseModel):
+    username: str = Field(..., min_length=3)
+    password: str = Field(..., min_length=8)
+
+
+class AuthResponse(BaseModel):
+    token: str
+    username: str
+
+
+class SavedScan(BaseModel):
+    id: int
+    prompt: str
+    student_context: StudentContext
+    matched_grants: List[MatchedGrant]
+    created_at: str
+
+
+app = FastAPI(title="SCAVENGER API", version="1.0.0")
+security = HTTPBearer(auto_error=False)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+def get_openai_client() -> Any:
+    import importlib
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key or importlib.util.find_spec("openai") is None:
+        return None
+    openai_module = importlib.import_module("openai")
+    return openai_module.OpenAI(api_key=api_key)
+
+
+@contextmanager
+def get_db() -> Generator[sqlite3.Connection, None, None]:
+    conn = sqlite3.connect(DATABASE_URL)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    os.makedirs(os.path.dirname(DATABASE_URL), exist_ok=True)
+    with get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                student_context TEXT NOT NULL,
+                matched_grants TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def build_token() -> tuple[str, str]:
+    token = secrets.token_urlsafe(32)
+    expires = datetime.now(timezone.utc) + timedelta(hours=TOKEN_TTL_HOURS)
+    return token, expires.isoformat()
+
+
+def parse_openai_json(response: Any) -> dict[str, Any]:
+    raw = getattr(response, "output_text", "")
+    if not raw:
+        raise ValueError("No JSON text in OpenAI response")
+    return json.loads(raw)
+
+
 def search_knowledge_base(user_prompt: str) -> List[MatchedGrant]:
     prompt = user_prompt.lower()
-
     return [
         MatchedGrant(
             name="Undergraduate Research Travel Fund",
@@ -90,55 +209,174 @@ def search_knowledge_base(user_prompt: str) -> List[MatchedGrant]:
     ]
 
 
+def retrieve_grants_with_assistant(user_prompt: str, student_context: StudentContext) -> List[MatchedGrant]:
+    client = get_openai_client()
+    if not client or not OPENAI_ASSISTANT_ID:
+        return search_knowledge_base(user_prompt)
+
+    try:
+        thread = client.beta.threads.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Return strict JSON with key matched_grants[] containing name, amount, deadline,"
+                        " match_score, next_step for top 3 campus grants. "
+                        f"Prompt: {user_prompt}. Student major: {student_context.major}. Role: {student_context.role}."
+                    ),
+                }
+            ]
+        )
+        run_kwargs: dict[str, Any] = {"assistant_id": OPENAI_ASSISTANT_ID}
+        if OPENAI_VECTOR_STORE_ID:
+            run_kwargs["tool_resources"] = {"file_search": {"vector_store_ids": [OPENAI_VECTOR_STORE_ID]}}
+        run = client.beta.threads.runs.create_and_poll(thread_id=thread.id, **run_kwargs)
+        if run.status != "completed":
+            raise ValueError(f"Assistant run did not complete: {run.status}")
+
+        messages = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
+        text = messages.data[0].content[0].text.value
+        data = json.loads(text)
+        return [MatchedGrant(**item) for item in data["matched_grants"]]
+    except Exception:
+        return search_knowledge_base(user_prompt)
+
+
 def analyze_eligibility_document(image_base64: str) -> EligibilityResponse:
-    # Mocked stand-in for GPT-4o vision + Structured Outputs.
-    # Produces deterministic output so the UI flow is testable without API keys.
-    length_bias = len(image_base64.strip())
-    extracted_gpa = 3.5 if length_bias > 100 else 3.1
-    missing_criteria = [] if extracted_gpa >= 3.2 else ["Minimum GPA 3.2"]
-    return EligibilityResponse(
-        eligible=not missing_criteria,
-        extracted_gpa=extracted_gpa,
-        missing_criteria=missing_criteria,
-    )
+    client = get_openai_client()
+    if not client:
+        length_bias = len(image_base64.strip())
+        extracted_gpa = 3.5 if length_bias > 100 else 3.1
+        missing = [] if extracted_gpa >= 3.2 else ["Minimum GPA 3.2"]
+        return EligibilityResponse(eligible=not missing, extracted_gpa=extracted_gpa, missing_criteria=missing)
+
+    try:
+        response = client.responses.create(
+            model=OPENAI_MODEL_VISION,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Extract GPA from this proof document and return JSON: eligible, extracted_gpa, missing_criteria[] using minimum GPA 3.2.",
+                        },
+                        {"type": "input_image", "image_url": f"data:image/png;base64,{image_base64}"},
+                    ],
+                }
+            ],
+        )
+        parsed = parse_openai_json(response)
+        return EligibilityResponse(**parsed)
+    except Exception:
+        return EligibilityResponse(eligible=False, extracted_gpa=0.0, missing_criteria=["Unable to parse eligibility"])
 
 
 def grade_and_rewrite_proposal(student_draft: str, grant_rubric: str) -> ProposalReviewResponse:
-    # Mocked stand-in for Structured Outputs grading endpoint.
-    draft_length = len(student_draft.strip())
-    rubric_hint = "budget" in grant_rubric.lower()
+    client = get_openai_client()
+    if not client:
+        draft_length = len(student_draft.strip())
+        score = 58 if draft_length < 120 else 74 if draft_length < 260 else 86
+        rewrites = ["Add measurable outcomes and align each paragraph with rubric criteria."]
+        return ProposalReviewResponse(score=score, suggested_rewrites=rewrites)
 
-    if draft_length < 120:
-        score = 58
-        suggestions = [
-            "Add a one-sentence statement of need with a specific amount.",
-            "Include dates and timeline for when funds are required.",
-        ]
-    elif draft_length < 260:
-        score = 74
-        suggestions = [
-            "Expand impact with one measurable outcome.",
-            "Add one sentence tying your ask to grant criteria.",
-        ]
-    else:
-        score = 86
-        suggestions = [
-            "Strong baseline draft. Tighten wording and add one verification source.",
-        ]
-
-    if rubric_hint:
-        suggestions.append("Include an itemized budget table or bullet list.")
-
-    return ProposalReviewResponse(score=score, suggested_rewrites=suggestions)
+    try:
+        response = client.responses.create(
+            model=OPENAI_MODEL_TEXT,
+            input=(
+                "Grade this proposal from 0-100 against rubric and return strict JSON with score and"
+                " suggested_rewrites (array)."
+                f"\nRubric: {grant_rubric}\nDraft: {student_draft}"
+            ),
+        )
+        parsed = parse_openai_json(response)
+        return ProposalReviewResponse(**parsed)
+    except Exception:
+        return ProposalReviewResponse(score=0, suggested_rewrites=["Automated review unavailable; revise manually."])
 
 
 def generate_autofill_payload(user_data: dict[str, Any], form_fields: List[str]) -> AutofillResponse:
-    mapped_fields = {field: str(user_data.get(field, "")) for field in form_fields}
+    client = get_openai_client()
+
+    if client:
+        try:
+            response = client.responses.create(
+                model=OPENAI_MODEL_TEXT,
+                input=(
+                    "Map user profile data to application form fields and return JSON with mapped_fields object."
+                    f" user_data={json.dumps(user_data)} form_fields={json.dumps(form_fields)}"
+                ),
+            )
+            mapped = parse_openai_json(response).get("mapped_fields", {})
+            mapped_fields = {field: str(mapped.get(field, user_data.get(field, ""))) for field in form_fields}
+        except Exception:
+            mapped_fields = {field: str(user_data.get(field, "")) for field in form_fields}
+    else:
+        mapped_fields = {field: str(user_data.get(field, "")) for field in form_fields}
+
     markdown_preview = "\n".join(
-        ["# Application Preview"]
-        + [f"- **{field}**: {mapped_fields[field] or '[missing]'}" for field in form_fields]
+        ["# Application Preview"] + [f"- **{f}**: {mapped_fields[f] or '[missing]'}" for f in form_fields]
     )
     return AutofillResponse(mapped_fields=mapped_fields, markdown_preview=markdown_preview)
+
+
+def build_pdf_from_fields(mapped_fields: dict[str, str]) -> str:
+    lines = ["SCAVENGER Application Export", ""] + [f"{k}: {v or '[missing]'}" for k, v in mapped_fields.items()]
+    text = "\n".join(lines)
+
+    safe_text = text.replace('\n', ') Tj T* (').replace('(', '[').replace(')', ']')
+    content_stream = f"BT /F1 12 Tf 50 750 Td ({safe_text}) Tj ET"
+    objects = [
+        "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
+        "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj",
+        "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj",
+        "4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj",
+        f"5 0 obj << /Length {len(content_stream)} >> stream\n{content_stream}\nendstream endobj",
+    ]
+    pdf = "%PDF-1.4\n"
+    offsets = []
+    for obj in objects:
+        offsets.append(len(pdf.encode("latin-1")))
+        pdf += obj + "\n"
+    xref_start = len(pdf.encode("latin-1"))
+    pdf += f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n"
+    for offset in offsets:
+        pdf += f"{offset:010d} 00000 n \n"
+    pdf += f"trailer << /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF"
+    return base64.b64encode(pdf.encode("latin-1", errors="ignore")).decode("utf-8")
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> sqlite3.Row:
+    if not credentials:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing auth token")
+
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT users.id, users.username, sessions.expires_at
+            FROM sessions JOIN users ON users.id = sessions.user_id
+            WHERE sessions.token = ?
+            """,
+            (credentials.credentials,),
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid auth token")
+
+    expires_at = datetime.fromisoformat(row["expires_at"])
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+
+    return row
+
+
+def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> sqlite3.Row | None:
+    if not credentials:
+        return None
+    try:
+        return get_current_user(credentials)
+    except HTTPException:
+        return None
 
 
 @app.get("/api/health")
@@ -146,15 +384,74 @@ def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/intake", response_model=IntakeResponse)
-def intake(payload: IntakeRequest) -> IntakeResponse:
-    if "force error" in payload.user_prompt.lower():
-        raise HTTPException(
-            status_code=503,
-            detail="Mock backend failure triggered for UI error-state testing.",
-        )
+@app.post("/api/auth/register", response_model=AuthResponse)
+def register(payload: AuthRequest) -> AuthResponse:
+    with get_db() as conn:
+        existing = conn.execute("SELECT id FROM users WHERE username = ?", (payload.username,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="Username already exists")
 
-    grants = search_knowledge_base(payload.user_prompt)
+        conn.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (payload.username, hash_password(payload.password), datetime.now(timezone.utc).isoformat()),
+        )
+        user_id = conn.execute("SELECT id FROM users WHERE username = ?", (payload.username,)).fetchone()["id"]
+        token, expires_at = build_token()
+        conn.execute("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)", (token, user_id, expires_at))
+    return AuthResponse(token=token, username=payload.username)
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login(payload: AuthRequest) -> AuthResponse:
+    with get_db() as conn:
+        user = conn.execute(
+            "SELECT id, username, password_hash FROM users WHERE username = ?",
+            (payload.username,),
+        ).fetchone()
+        if not user or user["password_hash"] != hash_password(payload.password):
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        token, expires_at = build_token()
+        conn.execute("INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)", (token, user["id"], expires_at))
+    return AuthResponse(token=token, username=user["username"])
+
+
+@app.get("/api/scans", response_model=List[SavedScan])
+def get_scans(current_user: sqlite3.Row = Depends(get_current_user)) -> List[SavedScan]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, prompt, student_context, matched_grants, created_at FROM scans WHERE user_id = ? ORDER BY id DESC LIMIT 25",
+            (current_user["id"],),
+        ).fetchall()
+
+    scans: List[SavedScan] = []
+    for row in rows:
+        scans.append(
+            SavedScan(
+                id=row["id"],
+                prompt=row["prompt"],
+                student_context=StudentContext(**json.loads(row["student_context"])),
+                matched_grants=[MatchedGrant(**item) for item in json.loads(row["matched_grants"])],
+                created_at=row["created_at"],
+            )
+        )
+    return scans
+
+
+@app.post("/api/intake", response_model=IntakeResponse)
+def intake(payload: IntakeRequest, current_user: sqlite3.Row | None = Depends(get_optional_user)) -> IntakeResponse:
+    grants = retrieve_grants_with_assistant(payload.user_prompt, payload.student_context)
+    if current_user:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO scans (user_id, prompt, student_context, matched_grants, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    current_user["id"],
+                    payload.user_prompt,
+                    payload.student_context.model_dump_json(),
+                    json.dumps([grant.model_dump() for grant in grants]),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
     return IntakeResponse(matched_grants=grants)
 
 
@@ -174,3 +471,10 @@ def review_proposal(
 @app.post("/api/autofill", response_model=AutofillResponse)
 def build_autofill(payload: AutofillRequest) -> AutofillResponse:
     return generate_autofill_payload(payload.user_data, payload.form_fields)
+
+
+@app.post("/api/autofill/pdf", response_model=PDFResponse)
+def export_filled_pdf(payload: AutofillRequest) -> PDFResponse:
+    autofill = generate_autofill_payload(payload.user_data, payload.form_fields)
+    pdf_base64 = build_pdf_from_fields(autofill.mapped_fields)
+    return PDFResponse(file_name="scavenger_application.pdf", pdf_base64=pdf_base64)
